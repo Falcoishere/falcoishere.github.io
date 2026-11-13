@@ -4,10 +4,14 @@ name: Update LeetCode Calendar
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "23 * * * *"
 
 permissions:
   contents: write
+
+concurrency:
+  group: leetcode-calendar
+  cancel-in-progress: false
 
 jobs:
   update-calendar:
@@ -17,7 +21,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Fetch LeetCode calendar
+      - name: Fetch and validate LeetCode calendar
         run: |
           node <<'NODE'
           const fs = require('fs');
@@ -36,46 +40,156 @@ jobs:
               }
             `;
 
-            const response = await fetch('https://leetcode.com/graphql/', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Referer': 'https://leetcode.com'
-              },
-              body: JSON.stringify({
-                query,
-                variables: { username, year }
-              })
-            });
+            let calendar = null;
+            let lastError = null;
 
-            if (!response.ok) {
-              throw new Error('LeetCode request failed: ' + response.status);
+            // Retry up to 4 times
+            for (let attempt = 1; attempt <= 4; attempt++) {
+              try {
+                console.log(`Fetching attempt ${attempt}/4`);
+
+                const response = await fetch(
+                  'https://leetcode.com/graphql/',
+                  {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'Referer': 'https://leetcode.com'
+                    },
+                    body: JSON.stringify({
+                      query,
+                      variables: { username, year }
+                    }),
+                    signal: AbortSignal.timeout(20000)
+                  }
+                );
+
+                if (!response.ok) {
+                  throw new Error(`HTTP ${response.status}`);
+                }
+
+                const result = await response.json();
+
+                if (result.errors?.length) {
+                  throw new Error(
+                    JSON.stringify(result.errors)
+                  );
+                }
+
+                const raw =
+                  result?.data?.matchedUser
+                    ?.userCalendar?.submissionCalendar;
+
+                if (!raw) {
+                  throw new Error('Calendar data is missing');
+                }
+
+                const parsed = JSON.parse(raw);
+
+                if (
+                  !parsed ||
+                  typeof parsed !== 'object' ||
+                  Array.isArray(parsed)
+                ) {
+                  throw new Error('Invalid calendar format');
+                }
+
+                const entries = Object.entries(parsed);
+
+                if (entries.some(([timestamp, count]) =>
+                  !/^\d+$/.test(timestamp) ||
+                  !Number.isFinite(Number(count)) ||
+                  Number(count) < 0
+                )) {
+                  throw new Error('Invalid calendar entries');
+                }
+
+                if (entries.length === 0) {
+                  throw new Error('Calendar is empty');
+                }
+
+                calendar = parsed;
+                break;
+
+              } catch (error) {
+                lastError = error;
+                console.log('Attempt failed:', error.message);
+
+                if (attempt < 4) {
+                  await new Promise(resolve =>
+                    setTimeout(resolve, attempt * 5000)
+                  );
+                }
+              }
             }
 
-            const result = await response.json();
-            const raw = result?.data?.matchedUser?.userCalendar?.submissionCalendar;
-
-            if (!raw) {
-              throw new Error('No LeetCode calendar found for ' + username);
+            if (!calendar) {
+              throw lastError || new Error('Fetch failed');
             }
 
-            const calendar = JSON.parse(raw);
+            // Preserve previous valid dates.
+            const file = 'leetcode.json';
+            let previous = {};
+
+            if (fs.existsSync(file)) {
+              try {
+                previous = JSON.parse(
+                  fs.readFileSync(file, 'utf8')
+                );
+              } catch {
+                console.log('Previous JSON could not be read.');
+              }
+            }
+
+            let merged = {};
+
+            if (Number(previous.year) === year) {
+              merged = previous.submissionCalendar || {};
+            }
+
+            for (const [timestamp, count] of Object.entries(calendar)) {
+              merged[timestamp] = Math.max(
+                Number(merged[timestamp] || 0),
+                Number(count)
+              );
+            }
+
+            const output = {
+              username,
+              year,
+              submissionCalendar: merged,
+              updatedAt: new Date().toISOString()
+            };
 
             fs.writeFileSync(
-              'leetcode.json',
-              JSON.stringify({
-                username,
-                year,
-                submissionCalendar: calendar,
-                updatedAt: new Date().toISOString()
-              }, null, 2) + '\n'
+              file,
+              JSON.stringify(output, null, 2) + '\n'
             );
 
-            console.log('LeetCode calendar updated successfully.');
+            const indiaDate = new Intl.DateTimeFormat(
+              'en-CA',
+              { timeZone: 'Asia/Kolkata' }
+            ).format(new Date());
+
+            const todayTimestamp = Math.floor(
+              new Date(`${indiaDate}T00:00:00+05:30`).getTime()
+              / 1000
+            );
+
+            console.log('Calendar saved successfully.');
+            console.log('India date:', indiaDate);
+            console.log(
+              'Today submissions:',
+              merged[todayTimestamp] || 0
+            );
+            console.log(
+              'Total calendar dates:',
+              Object.keys(merged).length
+            );
           }
 
           main().catch(error => {
-            console.error(error);
+            console.error('UPDATE FAILED:', error);
             process.exit(1);
           });
           NODE
@@ -84,7 +198,12 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add leetcode.json
-          git diff --cached --quiet || git commit -m "Update LeetCode calendar"
-          git push
-          
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Update LeetCode calendar"
+            git push
+          else
+            echo "No calendar changes to commit."
+          fi
